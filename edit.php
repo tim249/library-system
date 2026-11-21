@@ -3,351 +3,232 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/functions.php';
+require_once __DIR__ . '/../includes/auth_check.php';
 
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
+// Only logged-in members can access this page.
+requireMember();
 
-// Check authentication.
-if (!isset($_SESSION['user_id'])) {
-    header("Location: ../auth/login.php");
-    exit;
-}
-
-if ($_SESSION['role'] !== 'admin') {
-    header("Location: ../dashboard/index.php");
-    exit;
-}
-
-// Validate book ID.
-$bookId = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
-
-if (!$bookId || $bookId < 1) {
-    header("Location: index.php");
-    exit;
-}
-
-// Fetch the selected book.
-$stmt = $pdo->prepare(
-    "SELECT * FROM books WHERE book_id = ? LIMIT 1"
-);
-
-$stmt->execute([$bookId]);
-$book = $stmt->fetch(PDO::FETCH_ASSOC);
-
-if (!$book) {
-    header("Location: index.php");
-    exit;
-}
-
-// Fetch authors and categories.
-$authors = $pdo->query(
-    "SELECT author_id, name FROM authors ORDER BY name"
-)->fetchAll(PDO::FETCH_ASSOC);
-
-$categories = $pdo->query(
-    "SELECT category_id, name FROM categories ORDER BY name"
-)->fetchAll(PDO::FETCH_ASSOC);
-
-$error = '';
+// Get the reading-list entry ID.
+$readingId = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $readingId = filter_input(INPUT_POST, 'reading_id', FILTER_VALIDATE_INT);
+}
 
-    if (!verifyCsrfToken($_POST['csrf_token'] ?? '')) {
-        $error = "Invalid form submission. Please try again.";
-    } else {
+if (!$readingId || $readingId < 1) {
+    $_SESSION['error'] = 'Invalid reading-list entry.';
+    header('Location: index.php');
+    exit;
+}
 
-        $isbn = trim($_POST['isbn'] ?? '');
-        $title = trim($_POST['title'] ?? '');
-        $authorId = $_POST['author_id'] ?? '';
-        $categoryId = $_POST['category_id'] ?? '';
-        $publisher = trim($_POST['publisher'] ?? '');
-        $year = trim($_POST['year_published'] ?? '');
+$error = '';
+$entry = null;
 
-        $totalCopies = filter_var(
-            $_POST['total_copies'] ?? '',
-            FILTER_VALIDATE_INT
-        );
+try {
+    // Get the member ID linked to the logged-in user.
+    $stmt = $pdo->prepare(
+        'SELECT member_id
+         FROM users
+         WHERE user_id = :user_id
+         LIMIT 1'
+    );
 
-        if ($title === '') {
-            $error = "Book title is required.";
+    $stmt->execute([
+        'user_id' => $_SESSION['user_id']
+    ]);
 
-        } elseif ($totalCopies === false || $totalCopies < 1) {
-            $error = "Total copies must be at least 1.";
+    $member = $stmt->fetch();
 
-        } elseif (
-            $year !== '' &&
-            (!ctype_digit($year) ||
-            (int)$year < 1000 ||
-            (int)$year > (int)date('Y'))
-        ) {
-            $error = "Please enter a valid publication year.";
+    if (!$member || empty($member['member_id'])) {
+        $_SESSION['error'] = 'Your account is not linked to a library membership.';
+        header('Location: index.php');
+        exit;
+    }
 
+    $memberId = (int) $member['member_id'];
+
+    // Confirm that this entry belongs to the logged-in member.
+    $stmt = $pdo->prepare(
+        'SELECT
+            rl.reading_id,
+            rl.reading_status,
+            rl.notes,
+            b.title,
+            a.name AS author_name
+         FROM reading_lists rl
+         INNER JOIN books b ON rl.book_id = b.book_id
+         LEFT JOIN authors a ON b.author_id = a.author_id
+         WHERE rl.reading_id = :reading_id
+           AND rl.member_id = :member_id
+         LIMIT 1'
+    );
+
+    $stmt->execute([
+        'reading_id' => $readingId,
+        'member_id' => $memberId
+    ]);
+
+    $entry = $stmt->fetch();
+
+    if (!$entry) {
+        $_SESSION['error'] = 'Reading-list entry not found.';
+        header('Location: index.php');
+        exit;
+    }
+
+    // Process submitted changes.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $token = $_POST['csrf_token'] ?? '';
+
+        $readingStatus = trim($_POST['reading_status'] ?? '');
+        $notes = trim($_POST['notes'] ?? '');
+
+        // Preserve submitted values.
+        $entry['reading_status'] = $readingStatus;
+        $entry['notes'] = $notes;
+
+        if (!verifyCsrfToken($token)) {
+            $error = 'Invalid security token. Please refresh the page and try again.';
         } else {
+            $allowedStatuses = [
+                'Want to Read',
+                'Reading',
+                'Completed'
+            ];
 
-            $authorId = $authorId === '' ? null :
-                filter_var($authorId, FILTER_VALIDATE_INT);
-
-            $categoryId = $categoryId === '' ? null :
-                filter_var($categoryId, FILTER_VALIDATE_INT);
-
-            if (
-                ($authorId !== null &&
-                ($authorId === false || $authorId < 1)) ||
-                ($categoryId !== null &&
-                ($categoryId === false || $categoryId < 1))
-            ) {
-                $error = "Invalid author or category selected.";
-            }
-
-            // Check that selected author exists.
-            if ($error === '' && $authorId !== null) {
-                $check = $pdo->prepare(
-                    "SELECT COUNT(*) FROM authors WHERE author_id = ?"
+            if (!in_array($readingStatus, $allowedStatuses, true)) {
+                $error = 'Please select a valid reading status.';
+            } else {
+                $update = $pdo->prepare(
+                    'UPDATE reading_lists
+                     SET reading_status = :reading_status,
+                         notes = :notes
+                     WHERE reading_id = :reading_id
+                       AND member_id = :member_id'
                 );
-                $check->execute([$authorId]);
 
-                if ((int)$check->fetchColumn() === 0) {
-                    $error = "Selected author does not exist.";
-                }
-            }
+                $update->execute([
+                    'reading_status' => $readingStatus,
+                    'notes' => $notes !== '' ? $notes : null,
+                    'reading_id' => $readingId,
+                    'member_id' => $memberId
+                ]);
 
-            // Check that selected category exists.
-            if ($error === '' && $categoryId !== null) {
-                $check = $pdo->prepare(
-                    "SELECT COUNT(*) FROM categories WHERE category_id = ?"
-                );
-                $check->execute([$categoryId]);
+                $_SESSION['success'] = 'Your reading-list entry was updated successfully.';
 
-                if ((int)$check->fetchColumn() === 0) {
-                    $error = "Selected category does not exist.";
-                }
-            }
-
-            // Calculate how many copies are currently borrowed.
-            $borrowedCopies = (int)$book['total_copies']
-                - (int)$book['available_copies'];
-
-            if ($error === '' && $totalCopies < $borrowedCopies) {
-                $error = "Total copies cannot be less than the number of borrowed copies.";
-            }
-
-            // Update the book.
-            if ($error === '') {
-
-                $availableCopies = $totalCopies - $borrowedCopies;
-
-                try {
-
-                    $sql = "
-                        UPDATE books SET
-                            isbn = :isbn,
-                            title = :title,
-                            author_id = :author_id,
-                            category_id = :category_id,
-                            publisher = :publisher,
-                            year_published = :year_published,
-                            total_copies = :total_copies,
-                            available_copies = :available_copies
-                        WHERE book_id = :book_id
-                    ";
-
-                    $stmt = $pdo->prepare($sql);
-
-                    $stmt->execute([
-                        'isbn' => $isbn !== '' ? $isbn : null,
-                        'title' => $title,
-                        'author_id' => $authorId,
-                        'category_id' => $categoryId,
-                        'publisher' => $publisher !== '' ? $publisher : null,
-                        'year_published' => $year !== '' ? (int)$year : null,
-                        'total_copies' => $totalCopies,
-                        'available_copies' => $availableCopies,
-                        'book_id' => $bookId
-                    ]);
-
-                    header("Location: index.php");
-                    exit;
-
-                } catch (PDOException $e) {
-
-                    if ($e->getCode() === '23000') {
-                        $error = "This ISBN may already belong to another book.";
-                    } else {
-                        $error = "Unable to update the book. Please try again.";
-                    }
-                }
+                header('Location: index.php');
+                exit;
             }
         }
-
-        // Keep submitted values if validation fails.
-        $book = array_merge($book, [
-            'isbn' => $isbn,
-            'title' => $title,
-            'author_id' => $authorId ?: null,
-            'category_id' => $categoryId ?: null,
-            'publisher' => $publisher,
-            'year_published' => $year,
-            'total_copies' => $_POST['total_copies'] ?? $book['total_copies']
-        ]);
     }
+
+} catch (PDOException $e) {
+    error_log('Reading list edit error: ' . $e->getMessage());
+    $error = 'A database error occurred. Please try again.';
 }
+
+// Shared layout settings.
+$pageTitle = 'Edit Reading List';
+$extraCss = ['assets/css/reading-list.css'];
+
+require_once __DIR__ . '/../includes/header.php';
+require_once __DIR__ . '/../includes/navbar.php';
 ?>
 
-<!DOCTYPE html>
-<html lang="en">
+<div class="container">
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <div class="header">
+        <h1>Edit Reading List</h1>
 
-    <title>Edit Book | Library System</title>
+        <a href="index.php" class="back-link">
+            Back to My Reading List
+        </a>
+    </div>
 
-    <link rel="stylesheet" href="../assets/css/admin-dashboard.css">
-    <link rel="stylesheet" href="../assets/css/book-management.css">
-</head>
-
-<body>
-
-<div class="form-container">
-
-    <div class="form-card">
-
-        <h2>Edit Book</h2>
-
-        <p>Update the information for this book.</p>
+    <div class="panel">
 
         <?php if ($error !== ''): ?>
-            <div class="error-message">
-                <?= htmlspecialchars($error) ?>
+            <div class="message error">
+                <?= clean($error) ?>
             </div>
         <?php endif; ?>
 
-        <form method="POST"
-              action="edit.php?id=<?= (int)$bookId ?>">
+        <?php if ($entry): ?>
 
-            <input
-                type="hidden"
-                name="csrf_token"
-                value="<?= htmlspecialchars(csrfToken()) ?>"
+            <h2><?= clean($entry['title']) ?></h2>
+
+            <p class="welcome">
+                Author: <?= clean($entry['author_name'] ?? 'Unknown author') ?>
+            </p>
+
+            <form
+                method="POST"
+                action="edit.php?id=<?= (int) $readingId ?>"
+                class="edit-form"
             >
 
-            <div class="form-grid">
+                <input
+                    type="hidden"
+                    name="reading_id"
+                    value="<?= (int) $readingId ?>"
+                >
 
-                <div class="form-group">
-                    <label>Book Title *</label>
-                    <input
-                        type="text"
-                        name="title"
-                        value="<?= htmlspecialchars((string)$book['title']) ?>"
-                        required
+                <input
+                    type="hidden"
+                    name="csrf_token"
+                    value="<?= clean(csrfToken()) ?>"
+                >
+
+                <label for="reading_status">Reading Status</label>
+
+                <select name="reading_status" id="reading_status" required>
+
+                    <option
+                        value="Want to Read"
+                        <?= $entry['reading_status'] === 'Want to Read' ? 'selected' : '' ?>
                     >
-                </div>
+                        Want to Read
+                    </option>
 
-                <div class="form-group">
-                    <label>ISBN</label>
-                    <input
-                        type="text"
-                        name="isbn"
-                        value="<?= htmlspecialchars((string)($book['isbn'] ?? '')) ?>"
+                    <option
+                        value="Reading"
+                        <?= $entry['reading_status'] === 'Reading' ? 'selected' : '' ?>
                     >
-                </div>
+                        Reading
+                    </option>
 
-                <div class="form-group">
-                    <label>Author</label>
-                    <select name="author_id">
-
-                        <option value="">Select Author</option>
-
-                        <?php foreach ($authors as $author): ?>
-                            <option
-                                value="<?= (int)$author['author_id'] ?>"
-                                <?= (string)$book['author_id'] === (string)$author['author_id'] ? 'selected' : '' ?>
-                            >
-                                <?= htmlspecialchars($author['name']) ?>
-                            </option>
-                        <?php endforeach; ?>
-
-                    </select>
-                </div>
-
-                <div class="form-group">
-                    <label>Category</label>
-                    <select name="category_id">
-
-                        <option value="">Select Category</option>
-
-                        <?php foreach ($categories as $category): ?>
-                            <option
-                                value="<?= (int)$category['category_id'] ?>"
-                                <?= (string)$book['category_id'] === (string)$category['category_id'] ? 'selected' : '' ?>
-                            >
-                                <?= htmlspecialchars($category['name']) ?>
-                            </option>
-                        <?php endforeach; ?>
-
-                    </select>
-                </div>
-
-                <div class="form-group">
-                    <label>Publisher</label>
-                    <input
-                        type="text"
-                        name="publisher"
-                        value="<?= htmlspecialchars((string)($book['publisher'] ?? '')) ?>"
+                    <option
+                        value="Completed"
+                        <?= $entry['reading_status'] === 'Completed' ? 'selected' : '' ?>
                     >
-                </div>
+                        Completed
+                    </option>
 
-                <div class="form-group">
-                    <label>Year Published</label>
-                    <input
-                        type="number"
-                        name="year_published"
-                        min="1000"
-                        max="<?= date('Y') ?>"
-                        value="<?= htmlspecialchars((string)($book['year_published'] ?? '')) ?>"
-                    >
-                </div>
+                </select>
 
-                <div class="form-group">
-                    <label>Total Copies *</label>
-                    <input
-                        type="number"
-                        name="total_copies"
-                        min="1"
-                        value="<?= (int)$book['total_copies'] ?>"
-                        required
-                    >
-                </div>
+                <label for="notes">Personal Notes</label>
 
-                <div class="form-group">
-                    <label>Currently Available</label>
-                    <input
-                        type="number"
-                        value="<?= (int)$book['available_copies'] ?>"
-                        disabled
-                    >
-                </div>
+                <textarea
+                    name="notes"
+                    id="notes"
+                    rows="5"
+                    placeholder="Write your thoughts or notes about this book..."
+                ><?= clean($entry['notes'] ?? '') ?></textarea>
 
-            </div>
-
-            <div class="form-actions">
-
-                <button type="submit" class="btn btn-primary">
-                    Update Book
+                <button type="submit" class="update-btn">
+                    Save Changes
                 </button>
 
-                <a href="index.php" class="btn btn-secondary">
+                <a href="index.php" class="back-link">
                     Cancel
                 </a>
 
-            </div>
+            </form>
 
-        </form>
+        <?php endif; ?>
 
     </div>
 
 </div>
 
-</body>
-</html>
+<?php require_once __DIR__ . '/../includes/footer.php'; ?>
