@@ -1,205 +1,43 @@
 <?php
-declare(strict_types=1);
-
-require_once __DIR__ . '/../config/database.php';
-require_once __DIR__ . '/../includes/functions.php';
-require_once __DIR__ . '/../includes/auth_check.php';
-
-requireMember();
-
-// Get member ID.
-$stmt = $pdo->prepare("
-    SELECT member_id
-    FROM users
-    WHERE user_id = ?
-    LIMIT 1
-");
-
-$stmt->execute([$_SESSION['user_id']]);
-$member = $stmt->fetch();
-
-if (!$member || !$member['member_id']) {
-    die("Your account is not linked to a library member record.");
-}
-
-$memberId = (int) $member['member_id'];
-
-// Get reading list.
-$stmt = $pdo->prepare("
-    SELECT
-        rl.reading_id,
-        rl.reading_status,
-        rl.notes,
-        rl.date_added,
-        b.title,
-        a.name AS author_name
-    FROM reading_lists rl
-    INNER JOIN books b ON rl.book_id = b.book_id
-    LEFT JOIN authors a ON b.author_id = a.author_id
-    WHERE rl.member_id = ?
-    ORDER BY rl.date_added DESC
-");
-
-$stmt->execute([$memberId]);
-$readingList = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Member information.
-$fullName = $_SESSION['full_name'] ?? 'Member';
-
-// Display messages.
-$success = $_SESSION['success'] ?? '';
-$error = $_SESSION['error'] ?? '';
-
-unset($_SESSION['success'], $_SESSION['error']);
-
-// Shared layout.
-$pageTitle = 'My Reading List';
-
-$extraCss = [
-    'assets/css/reading-list.css'
-];
-
-require_once __DIR__ . '/../includes/header.php';
-require_once __DIR__ . '/../includes/navbar.php';
+require_once __DIR__ . '/../Includes/Auth_check.php';
+require_role('admin', 'librarian');
+$counts = (new Loan(db()))->dashboardCounts();
+$overdue = (new Reports(db()))->overdueList();
+$pageTitle = 'Dashboard';
+require __DIR__ . '/../Includes/Header.php';
 ?>
-
-<div class="container">
-
-    <header class="header">
-
-        <div>
-            <h1>My Reading List</h1>
-            <p>Welcome, <?= clean($fullName) ?>.</p>
-        </div>
-
-        <a href="create.php" class="add-btn">
-            + Add New Book
-        </a>
-
-    </header>
-
-    <a href="../dashboard/index.php" class="back-link">
-        ← Back to Dashboard
-    </a>
-
-    <?php if ($success !== ''): ?>
-
-        <div class="message success">
-            <?= clean($success) ?>
-        </div>
-
-    <?php endif; ?>
-
-    <?php if ($error !== ''): ?>
-
-        <div class="message error">
-            <?= clean($error) ?>
-        </div>
-
-    <?php endif; ?>
-
-    <section class="panel">
-
-        <h2>My Saved Books (<?= count($readingList) ?>)</h2>
-
-        <?php if (!empty($readingList)): ?>
-
-            <div class="reading-list">
-
-                <?php foreach ($readingList as $item): ?>
-
-                    <article class="book-card">
-
-                        <div class="book-info">
-
-                            <h3><?= clean($item['title']) ?></h3>
-
-                            <p>
-                                Author:
-                                <?= clean($item['author_name'] ?? 'Unknown') ?>
-                            </p>
-
-                            <span class="status">
-                                <?= clean($item['reading_status']) ?>
-                            </span>
-
-                            <p class="notes">
-                                Notes:
-                                <?= clean($item['notes'] ?? '') ?: 'No notes added.' ?>
-                            </p>
-
-                            <small>
-                                Added:
-                                <?= clean($item['date_added']) ?>
-                            </small>
-
-                        </div>
-
-                        <div class="book-actions">
-
-                            <a
-                                href="edit.php?id=<?= (int) $item['reading_id'] ?>"
-                                class="edit-btn"
-                            >
-                                Edit
-                            </a>
-
-                            <form
-                                action="delete.php"
-                                method="POST"
-                                class="delete-form"
-                                onsubmit="return confirm('Are you sure you want to remove this book from your reading list?');"
-                            >
-
-                                <input
-                                    type="hidden"
-                                    name="csrf_token"
-                                    value="<?= clean(csrfToken()) ?>"
-                                >
-
-                                <input
-                                    type="hidden"
-                                    name="reading_id"
-                                    value="<?= (int) $item['reading_id'] ?>"
-                                >
-
-                                <button type="submit" class="delete-btn">
-                                    Delete
-                                </button>
-
-                            </form>
-
-                        </div>
-
-                    </article>
-
-                <?php endforeach; ?>
-
-            </div>
-
-        <?php else: ?>
-
-            <div class="empty">
-
-                <h3>Your reading list is empty.</h3>
-
-                <p>
-                    Start building your personal reading list
-                    by adding a book.
-                </p>
-
-                <a href="create.php" class="add-btn">
-                    Add Your First Book
-                </a>
-
-            </div>
-
-        <?php endif; ?>
-
-    </section>
-
+<div class="page-heading">
+    <div>
+        <h1>Dashboard</h1>
+        <p class="muted">Live snapshot of catalogue, circulation and dues.</p>
+    </div>
+    <a class="button" href="<?= e(url('/Loans/Issue.php')) ?>">Issue a book</a>
 </div>
-
-<script src="<?= $baseUrl ?>/assets/js/reading-list.js"></script>
-
-<?php require_once __DIR__ . '/../includes/footer.php'; ?>
+<section class="cards">
+    <article class="card"><div class="card-label">Titles</div><div class="metric"><?= (int) ($counts['total_books'] ?? 0) ?></div></article>
+    <article class="card"><div class="card-label">Available copies</div><div class="metric"><?= (int) ($counts['available_copies'] ?? 0) ?></div></article>
+    <article class="card"><div class="card-label">Active members</div><div class="metric"><?= (int) ($counts['active_members'] ?? 0) ?></div></article>
+    <article class="card"><div class="card-label">Books out</div><div class="metric"><?= (int) ($counts['active_loans'] ?? 0) ?></div></article>
+    <article class="card"><div class="card-label">Overdue</div><div class="metric"><?= (int) ($counts['overdue_loans'] ?? 0) ?></div></article>
+    <article class="card"><div class="card-label">Pending reservations</div><div class="metric"><?= (int) ($counts['pending_reservations'] ?? 0) ?></div></article>
+    <article class="card"><div class="card-label">Unpaid fines</div><div class="metric"><?= number_format((float) ($counts['unpaid_fines'] ?? 0), 2) ?></div></article>
+</section>
+<section class="panel">
+    <h2>Overdue loans</h2>
+    <div class="table-wrap"><table>
+        <thead><tr><th>Member</th><th>Book</th><th>Due</th><th>Days late</th><th></th></tr></thead>
+        <tbody>
+        <?php foreach (array_slice($overdue, 0, 8) as $row): ?>
+            <tr class="overdue-row">
+                <td><strong><?= e($row['full_name']) ?></strong><br><span class="muted"><?= e($row['member_number']) ?></span></td>
+                <td><?= e($row['title']) ?></td>
+                <td><?= e($row['due_date']) ?></td>
+                <td><?= (int) $row['days_overdue'] ?></td>
+                <td><a class="button-small" href="<?= e(url('/Loans/Return.php?id=' . (int) $row['loan_id'])) ?>">Return</a></td>
+            </tr>
+        <?php endforeach; ?>
+        <?php if (!$overdue): ?><tr><td class="empty" colspan="5">No overdue loans right now.</td></tr><?php endif; ?>
+        </tbody>
+    </table></div>
+</section>
+<?php require __DIR__ . '/../Includes/Footer.php'; ?>
